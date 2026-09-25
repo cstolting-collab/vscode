@@ -486,10 +486,14 @@ export class SQLiteStorageDatabase implements IStorageDatabase {
 
 				stmt.removeListener('error', statementErrorListener);
 
-				if (statementError) {
+				if ((statementError as Error & { code?: string } | undefined)?.code === 'SQLITE_BUSY') {
 					return reject(statementError);
 				}
 
+				// Preserve the storage layer's existing recovery semantics for non-busy
+				// SQLite errors: mark the connection erroneous and allow the cached state
+				// to be recovered on close. SQLITE_BUSY is different because it is
+				// transient contention and must be observable by the caller for retry.
 				return resolve();
 			});
 		});
