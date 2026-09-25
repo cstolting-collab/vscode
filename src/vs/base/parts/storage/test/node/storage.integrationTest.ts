@@ -4,8 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as fs from 'fs';
-import { deepStrictEqual, ok, strictEqual } from 'assert';
+import { deepStrictEqual, ok, rejects, strictEqual } from 'assert';
 import { tmpdir } from 'os';
+import type { Database } from '@vscode/sqlite3';
 import { timeout } from '../../../../common/async.js';
 import { Emitter, Event } from '../../../../common/event.js';
 import { join } from '../../../../common/path.js';
@@ -13,7 +14,7 @@ import { isWindows } from '../../../../common/platform.js';
 import { URI } from '../../../../common/uri.js';
 import { generateUuid } from '../../../../common/uuid.js';
 import { Promises } from '../../../../node/pfs.js';
-import { isStorageItemsChangeEvent, IStorageDatabase, IStorageItemsChangeEvent, Storage } from '../../common/storage.js';
+import { isStorageItemsChangeEvent, IStorageDatabase, IStorageItemsChangeEvent, Storage, StorageHint } from '../../common/storage.js';
 import { ISQLiteStorageDatabaseOptions, SQLiteStorageDatabase } from '../../node/storage.js';
 import { runWithFakedTimers } from '../../../../test/common/timeTravelScheduler.js';
 import { flakySuite, getRandomTestPath } from '../../../../test/node/testUtils.js';
@@ -311,6 +312,40 @@ flakySuite('Storage Library', function () {
 		});
 	});
 
+	test('failed flush preserves pending changes', async () => {
+		const persisted = new Map<string, string>();
+		let failNextUpdate = true;
+		const database: IStorageDatabase = {
+			onDidChangeItemsExternal: Event.None,
+			async getItems() {
+				return new Map(persisted);
+			},
+			async updateItems(request) {
+				if (failNextUpdate) {
+					failNextUpdate = false;
+					throw new Error('expected update failure');
+				}
+
+				request.insert?.forEach((value, key) => persisted.set(key, value));
+				request.delete?.forEach(key => persisted.delete(key));
+			},
+			async optimize() { },
+			async close() { }
+		};
+
+		const storage = new Storage(database, { hint: StorageHint.STORAGE_IN_MEMORY });
+		await storage.init();
+
+		await rejects(storage.set('foo', 'bar'), /expected update failure/);
+		strictEqual(persisted.has('foo'), false);
+
+		// The rejected request must remain pending and succeed on the next flush.
+		await storage.flush(0);
+		strictEqual(persisted.get('foo'), 'bar');
+
+		await storage.close();
+	});
+
 	test('corrupt DB recovers', async () => {
 		return runWithFakedTimers({}, async function () {
 			const storageFile = join(testDir, 'storage.db');
@@ -349,6 +384,27 @@ flakySuite('SQLite Storage Library', function () {
 		return set;
 	}
 
+
+	async function openDatabase(path: string): Promise<Database> {
+		const { default: sqlite3 } = await import('@vscode/sqlite3');
+
+		return new Promise((resolve, reject) => {
+			const database = new sqlite3.Database(path, error => error ? reject(error) : resolve(database));
+		});
+	}
+
+	function execDatabase(database: Database, sql: string): Promise<void> {
+		return new Promise((resolve, reject) => {
+			database.exec(sql, error => error ? reject(error) : resolve());
+		});
+	}
+
+	function closeDatabase(database: Database): Promise<void> {
+		return new Promise((resolve, reject) => {
+			database.close(error => error ? reject(error) : resolve());
+		});
+	}
+
 	let testdir: string;
 
 	setup(function () {
@@ -359,6 +415,66 @@ flakySuite('SQLite Storage Library', function () {
 
 	teardown(function () {
 		return Promises.rm(testdir);
+	});
+
+	test('busy timeout waits for a transient read lock', async () => {
+		const storagePath = join(testdir, 'busy-timeout.db');
+		const storage = new SQLiteStorageDatabase(storagePath, { busyTimeout: 1000 });
+		await storage.getItems();
+
+		const blocker = await openDatabase(storagePath);
+		await execDatabase(blocker, 'BEGIN TRANSACTION; SELECT * FROM ItemTable;');
+
+		try {
+			const updatePromise = storage.updateItems({ insert: new Map([['foo', 'bar']]) });
+
+			// Release within the configured busy timeout. COMMIT should wait rather
+			// than surface SQLITE_BUSY.
+			await timeout(50);
+			await execDatabase(blocker, 'END TRANSACTION');
+			await updatePromise;
+
+			strictEqual((await storage.getItems()).get('foo'), 'bar');
+		} finally {
+			await closeDatabase(blocker);
+			await storage.close();
+		}
+	});
+
+	test('SQLITE_BUSY is transient and leaves the database usable', async () => {
+		const storagePath = join(testdir, 'busy-recovery.db');
+		const storage = new SQLiteStorageDatabase(storagePath, { busyTimeout: 25 });
+		await storage.getItems();
+
+		const blocker = await openDatabase(storagePath);
+		await execDatabase(blocker, 'BEGIN TRANSACTION; SELECT * FROM ItemTable;');
+
+		let busyError: (Error & { code?: string }) | undefined;
+		try {
+			try {
+				await storage.updateItems({ insert: new Map([['foo', 'blocked']]) });
+			} catch (error) {
+				busyError = error as Error & { code?: string };
+			}
+
+			strictEqual(busyError?.code, 'SQLITE_BUSY');
+		} finally {
+			await execDatabase(blocker, 'END TRANSACTION');
+			await closeDatabase(blocker);
+		}
+
+		// The failed transaction must have been rolled back so the connection
+		// can immediately accept a later write.
+		await storage.updateItems({ insert: new Map([['foo', 'recovered']]) });
+		strictEqual((await storage.getItems()).get('foo'), 'recovered');
+
+		// Contention is not corruption and must not trigger close-time recovery.
+		let recoveryCalled = false;
+		await storage.close(() => {
+			recoveryCalled = true;
+			return new Map();
+		});
+		strictEqual(recoveryCalled, false);
 	});
 
 	async function testDBBasics(path: string, logError?: (error: Error | string) => void) {
