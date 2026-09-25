@@ -372,15 +372,34 @@ export class Storage extends Disposable implements IStorage {
 		this.pendingDeletes = new Set<string>();
 		this.pendingInserts = new Map<string, string>();
 
-		// Update in storage and release any
-		// waiters we have once done
-		return this.database.updateItems(updateRequest).finally(() => {
+		try {
+			// Update in storage. If this fails, restore the request below so a
+			// later flush can retry it instead of silently dropping the write.
+			await this.database.updateItems(updateRequest);
+		} catch (error) {
+			// Writes that arrived while the failed update was in flight win over
+			// the older request. Only restore keys that have not been superseded.
+			updateRequest.insert?.forEach((value, key) => {
+				if (!this.pendingInserts.has(key) && !this.pendingDeletes.has(key)) {
+					this.pendingInserts.set(key, value);
+				}
+			});
+
+			updateRequest.delete?.forEach(key => {
+				if (!this.pendingInserts.has(key) && !this.pendingDeletes.has(key)) {
+					this.pendingDeletes.add(key);
+				}
+			});
+
+			throw error;
+		} finally {
+			// Release waiters only when there is truly nothing left to flush.
 			if (!this.hasPending) {
 				while (this.whenFlushedCallbacks.length) {
 					this.whenFlushedCallbacks.pop()?.();
 				}
 			}
-		});
+		}
 	}
 
 	async flush(delay?: number): Promise<void> {
