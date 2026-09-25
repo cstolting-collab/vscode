@@ -1,0 +1,85 @@
+name: Fork Storage Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'src/vs/base/parts/storage/common/storage.ts'
+      - 'src/vs/base/parts/storage/node/storage.ts'
+      - 'src/vs/base/parts/storage/test/node/storage.integrationTest.ts'
+      - 'src/vs/platform/storage/electron-main/storageMain.ts'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  storage-validation:
+    name: Storage / SQLite validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      VSCODE_ARCH: x64
+      NPM_ARCH: x64
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxkbfile-dev \
+            libnotify-bin \
+            libkrb5-dev \
+            libgtk-3-0 \
+            libgbm1 \
+            xvfb
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: TypeScript typecheck
+        run: npm run typecheck-client
+
+      - name: Transpile client
+        run: npm run gulp transpile-client-esbuild
+
+      - name: Setup Electron
+        uses: ./.github/actions/setup-electron
+        with:
+          arch: x64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start Xvfb
+        run: |
+          Xvfb :10 -screen 0 1920x1080x24 > /tmp/xvfb.log 2>&1 &
+          echo $! > /tmp/xvfb.pid
+          sleep 2
+
+      - name: Run storage integration tests
+        run: ./scripts/test.sh src/vs/base/parts/storage/test/node/storage.integrationTest.ts --timeout 20000
+        env:
+          DISPLAY: ':10'
+          VSCODE_SKIP_PRELAUNCH: '1'
+
+      - name: Show Xvfb log on failure
+        if: failure()
+        run: cat /tmp/xvfb.log || true
