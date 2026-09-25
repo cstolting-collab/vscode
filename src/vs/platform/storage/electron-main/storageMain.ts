@@ -116,6 +116,7 @@ export interface IStorageChangeEvent {
 abstract class BaseStorageMain extends Disposable implements IStorageMain {
 
 	private static readonly LOG_SLOW_CLOSE_THRESHOLD = 2000;
+	private static readonly SQLITE_BUSY_TIMEOUT = 2000;
 
 	protected readonly _onDidChangeStorage = this._register(new Emitter<IStorageChangeEvent>());
 	readonly onDidChangeStorage = this._onDidChangeStorage.event;
@@ -200,6 +201,13 @@ abstract class BaseStorageMain extends Disposable implements IStorageMain {
 		};
 	}
 
+	protected createSQLiteStorageDatabase(path: string): SQLiteStorageDatabase {
+		return new SQLiteStorageDatabase(path, {
+			logging: this.createLoggingOptions(),
+			busyTimeout: BaseStorageMain.SQLITE_BUSY_TIMEOUT
+		});
+	}
+
 	protected doInit(storage: IStorage): Promise<void> {
 		return storage.init();
 	}
@@ -214,12 +222,18 @@ abstract class BaseStorageMain extends Disposable implements IStorageMain {
 		return this._storage.get(key, fallbackValue);
 	}
 
-	set(key: string, value: string | boolean | number | undefined | null): Promise<void> {
-		return this._storage.set(key, value);
+	set(key: string, value: string | boolean | number | undefined | null): void {
+		void this._storage.set(key, value).catch(error => {
+			// IStorageMain writes are fire-and-forget by contract. Observe the promise
+			// so a persistence failure cannot become an unhandled main-process rejection.
+			this.logService.error(`[storage main] set(): Unable to persist storage due to ${error}`);
+		});
 	}
 
-	delete(key: string): Promise<void> {
-		return this._storage.delete(key);
+	delete(key: string): void {
+		void this._storage.delete(key).catch(error => {
+			this.logService.error(`[storage main] delete(): Unable to persist storage due to ${error}`);
+		});
 	}
 
 	optimize(): Promise<void> {
@@ -302,9 +316,7 @@ class BaseProfileAwareStorageMain extends BaseStorageMain {
 	}
 
 	protected async doCreate(): Promise<Storage> {
-		return new Storage(new SQLiteStorageDatabase(this.path ?? SQLiteStorageDatabase.IN_MEMORY_PATH, {
-			logging: this.createLoggingOptions()
-		}), !this.path ? { hint: StorageHint.STORAGE_IN_MEMORY } : undefined);
+		return new Storage(this.createSQLiteStorageDatabase(this.path ?? SQLiteStorageDatabase.IN_MEMORY_PATH), !this.path ? { hint: StorageHint.STORAGE_IN_MEMORY } : undefined);
 	}
 }
 
@@ -375,9 +387,7 @@ export class ApplicationSharedStorageMain extends BaseStorageMain {
 
 		this.logService.info(`[shared storage] Creating shared storage database at '${storageFilePath}' (wasCreated: ${wasCreated})`);
 
-		const database = new SQLiteStorageDatabase(storageFilePath, {
-			logging: this.createLoggingOptions()
-		});
+		const database = this.createSQLiteStorageDatabase(storageFilePath);
 
 		this.logService.info(`[shared storage] Initializing fallback application storage (path: ${this.applicationStorage.path ?? 'in-memory'})`);
 		await this.applicationStorage.init();
@@ -436,9 +446,7 @@ export class WorkspaceStorageMain extends BaseStorageMain {
 	protected async doCreate(): Promise<Storage> {
 		const { storageFilePath, wasCreated } = await this.prepareWorkspaceStorageFolder();
 
-		return new Storage(new SQLiteStorageDatabase(storageFilePath, {
-			logging: this.createLoggingOptions()
-		}), { hint: this.options.useInMemoryStorage ? StorageHint.STORAGE_IN_MEMORY : wasCreated ? StorageHint.STORAGE_DOES_NOT_EXIST : undefined });
+		return new Storage(this.createSQLiteStorageDatabase(storageFilePath), { hint: this.options.useInMemoryStorage ? StorageHint.STORAGE_IN_MEMORY : wasCreated ? StorageHint.STORAGE_DOES_NOT_EXIST : undefined });
 	}
 
 	private async prepareWorkspaceStorageFolder(): Promise<{ storageFilePath: string; wasCreated: boolean }> {
