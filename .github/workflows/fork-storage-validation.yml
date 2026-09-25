@@ -68,6 +68,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Configure Electron sandbox
+        run: |
+          sudo chown root:root .build/electron/chrome-sandbox
+          sudo chmod 4755 .build/electron/chrome-sandbox
+
       - name: Start Xvfb
         run: |
           Xvfb :10 -screen 0 1920x1080x24 > /tmp/xvfb.log 2>&1 &
